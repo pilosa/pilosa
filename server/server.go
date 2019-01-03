@@ -35,6 +35,7 @@ import (
 	"golang.org/x/sync/errgroup"
 
 	"github.com/pilosa/pilosa"
+	"github.com/pilosa/pilosa/badger"
 	"github.com/pilosa/pilosa/boltdb"
 	"github.com/pilosa/pilosa/encoding/proto"
 	"github.com/pilosa/pilosa/gcnotify"
@@ -243,6 +244,16 @@ func (m *Command) SetupServer() error {
 	if m.Config.Cluster.Coordinator || len(m.Config.Gossip.Seeds) == 0 {
 		coordinatorOpt = pilosa.OptServerIsCoordinator(true)
 	}
+	// Set Storage Engine
+	var serverAttrStore pilosa.ServerOption
+	switch m.Config.AttrStore {
+	case "boltdb":
+		serverAttrStore = pilosa.OptServerAttrStoreFunc(boltdb.NewAttrStore)
+	case "badger":
+		serverAttrStore = pilosa.OptServerAttrStoreFunc(badger.NewAttrStore)
+	default:
+		return errors.Errorf("no such storage engine %s ", m.Config.AttrStore)
+	}
 
 	serverOptions := []pilosa.ServerOption{
 		pilosa.OptServerAntiEntropyInterval(time.Duration(m.Config.AntiEntropy.Interval)),
@@ -254,7 +265,6 @@ func (m *Command) SetupServer() error {
 		pilosa.OptServerDiagnosticsInterval(diagnosticsInterval),
 
 		pilosa.OptServerLogger(m.logger),
-		pilosa.OptServerAttrStoreFunc(boltdb.NewAttrStore),
 		pilosa.OptServerSystemInfo(gopsutil.NewSystemInfo()),
 		pilosa.OptServerGCNotifier(gcnotify.NewActiveGCNotifier()),
 		pilosa.OptServerStatsClient(statsClient),
@@ -264,6 +274,7 @@ func (m *Command) SetupServer() error {
 		pilosa.OptServerClusterDisabled(m.Config.Cluster.Disabled, m.Config.Cluster.Hosts),
 		pilosa.OptServerSerializer(proto.Serializer{}),
 		coordinatorOpt,
+		serverAttrStore,
 	}
 
 	if m.Config.Translation.MapSize > 0 {
