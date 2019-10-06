@@ -180,11 +180,11 @@ type cluster struct { // nolint: maligned
 	Node  *Node
 	nodes []*Node
 
-	// Hashing algorithm used to assign partitions to nodes.
-	Hasher Hasher
-
-	// The number of partitions in the cluster.
-	partitionN int
+	// Shard distributing algorithms to distribute shards to nodes.
+	shardDistributors map[string]ShardDistributor
+	// Default for indexes that have not been assigned a shard distributor.
+	// This should be the same value as `holder.defaultShardDistributor`.
+	defaultShardDistributor string
 
 	// The number of replicas a partition has.
 	ReplicaN int
@@ -232,9 +232,9 @@ type cluster struct { // nolint: maligned
 // newCluster returns a new instance of Cluster with defaults.
 func newCluster() *cluster {
 	return &cluster{
-		Hasher:     &jmphasher{},
-		partitionN: defaultPartitionN,
-		ReplicaN:   1,
+		shardDistributors:       map[string]ShardDistributor{JUMP: newJumpDistributor(defaultPartitionN)},
+		defaultShardDistributor: JUMP,
+		ReplicaN:                1,
 
 		joiningLeavingNodes: make(chan nodeAction, 10), // buffered channel
 		jobs:                make(map[int64]*resizeJob),
@@ -370,7 +370,7 @@ func (c *cluster) unprotectedUpdateCoordinator(n *Node) bool {
 }
 
 // addNode adds a node to the Cluster and updates and saves the
-// new topology. unprotected.
+// new topology. This also updates the shard distributor. unprotected.
 func (c *cluster) addNode(node *Node) error {
 	// If the node being added is the coordinator, set it for this node.
 	if node.IsCoordinator {
@@ -380,6 +380,13 @@ func (c *cluster) addNode(node *Node) error {
 	// add to cluster
 	if !c.addNodeBasicSorted(node) {
 		return nil
+	}
+
+	// add to shardDistributors
+	for distName, distributor := range c.shardDistributors {
+		if err := distributor.AddNode(node.ID); err != nil {
+			return fmt.Errorf("adding node to shard distributor %s: %v", distName, err)
+		}
 	}
 
 	// add to topology
@@ -396,10 +403,17 @@ func (c *cluster) addNode(node *Node) error {
 }
 
 // removeNode removes a node from the Cluster and updates and saves the
-// new topology. unprotected.
+// new topology. This also updates the shard distributor. unprotected.
 func (c *cluster) removeNode(nodeID string) error {
 	// remove from cluster
 	c.removeNodeBasicSorted(nodeID)
+
+	// remove from shardDistributors
+	for shardDistName, shardDistributor := range c.shardDistributors {
+		if err := shardDistributor.RemoveNode(nodeID); err != nil {
+			return fmt.Errorf("removing node from shard distributor %s: %v", shardDistName, err)
+		}
+	}
 
 	// remove from topology
 	if c.Topology == nil {
@@ -781,8 +795,8 @@ func (c *cluster) fragSources(to *cluster, idx *Index) (map[string][]*ResizeSour
 	if action == resizeJobActionAdd && c.ReplicaN > 1 {
 		srcCluster = newCluster()
 		srcCluster.nodes = Nodes(c.nodes).Clone()
-		srcCluster.Hasher = c.Hasher
-		srcCluster.partitionN = c.partitionN
+		srcCluster.shardDistributors = shardDistributors(c.shardDistributors).Clone()
+		srcCluster.defaultShardDistributor = c.defaultShardDistributor
 		srcCluster.ReplicaN = 1
 	}
 
@@ -843,16 +857,26 @@ func (c *cluster) fragSources(to *cluster, idx *Index) (map[string][]*ResizeSour
 	return m, nil
 }
 
-// partition returns the partition that a shard belongs to.
-func (c *cluster) partition(index string, shard uint64) int {
-	var buf [8]byte
-	binary.BigEndian.PutUint64(buf[:], shard)
+type shardDistributors map[string]ShardDistributor
 
-	// Hash the bytes and mod by partition count.
-	h := fnv.New64a()
-	_, _ = h.Write([]byte(index))
-	_, _ = h.Write(buf[:])
-	return int(h.Sum64() % uint64(c.partitionN))
+// Clone returns a shallow copy of shard distributors.
+func (s shardDistributors) Clone() shardDistributors {
+	clone := make(shardDistributors)
+	for shardDistName, shardDistributor := range s {
+		clone[shardDistName] = shardDistributor
+	}
+	return clone
+}
+
+// shardDistributor returns the shardDistributor of the index. If the index
+// doesn't exist yet, use the default shard distributor.
+func (c *cluster) shardDistributor(indexName string) string {
+	if c.holder != nil {
+		if index, ok := c.holder.indexes[indexName]; ok {
+			return index.shardDistributor
+		}
+	}
+	return c.defaultShardDistributor
 }
 
 // ShardNodes returns a list of nodes that own a fragment. Safe for concurrent use.
@@ -864,7 +888,15 @@ func (c *cluster) ShardNodes(index string, shard uint64) []*Node {
 
 // shardNodes returns a list of nodes that own a fragment. unprotected
 func (c *cluster) shardNodes(index string, shard uint64) []*Node {
-	return c.partitionNodes(c.partition(index, shard))
+	shardDistName := c.shardDistributor(index)
+	shardDistributor := c.shardDistributors[shardDistName]
+	nodeIDs := shardDistributor.NodeOwners(c.nodeIDs(), c.ReplicaN, index, shard)
+	nodes := make([]*Node, 0)
+	for _, ID := range nodeIDs {
+		node := c.unprotectedNodeByID(ID)
+		nodes = append(nodes, node)
+	}
+	return nodes
 }
 
 // ownsShard returns true if a host owns a fragment.
@@ -874,36 +906,12 @@ func (c *cluster) ownsShard(nodeID string, index string, shard uint64) bool {
 	return Nodes(c.shardNodes(index, shard)).ContainsID(nodeID)
 }
 
-// partitionNodes returns a list of nodes that own a partition. unprotected.
-func (c *cluster) partitionNodes(partitionID int) []*Node {
-	// Default replica count to between one and the number of nodes.
-	// The replica count can be zero if there are no nodes.
-	replicaN := c.ReplicaN
-	if replicaN > len(c.nodes) {
-		replicaN = len(c.nodes)
-	} else if replicaN == 0 {
-		replicaN = 1
-	}
-
-	// Determine primary owner node.
-	nodeIndex := c.Hasher.Hash(uint64(partitionID), len(c.nodes))
-
-	// Collect nodes around the ring.
-	nodes := make([]*Node, replicaN)
-	for i := 0; i < replicaN; i++ {
-		nodes[i] = c.nodes[(nodeIndex+i)%len(c.nodes)]
-	}
-
-	return nodes
-}
-
 // containsShards is like OwnsShards, but it includes replicas.
 func (c *cluster) containsShards(index string, availableShards *roaring.Bitmap, node *Node) []uint64 {
 	var shards []uint64
 	availableShards.ForEach(func(i uint64) {
-		p := c.partition(index, i)
-		// Determine the nodes for partition.
-		nodes := c.partitionNodes(p)
+		// Determine the nodes for each shard.
+		nodes := c.shardNodes(index, i)
 		for _, n := range nodes {
 			if n.ID == node.ID {
 				shards = append(shards, i)
@@ -913,17 +921,42 @@ func (c *cluster) containsShards(index string, availableShards *roaring.Bitmap, 
 	return shards
 }
 
-// Hasher represents an interface to hash integers into buckets.
-type Hasher interface {
-	// Hashes the key into a number between [0,N).
-	Hash(key uint64, n int) int
+// ShardDistributor distributes shards to nodes.
+type ShardDistributor interface {
+	// NodeOwners returns a list of nodes that own a fragment.
+	NodeOwners(nodeIDs []string, replicaN int, index string, shard uint64) []string
+	// AddNode adds a new node to the shard distributor.
+	AddNode(nodeID string) error
+	// RemoveNode removes a node from the shard distributor.
+	RemoveNode(nodeID string) error
 }
 
-// jmphasher represents an implementation of jmphash. Implements Hasher.
-type jmphasher struct{}
+// JUMP is the name for `jumpDistributor`.
+const JUMP = "jump"
+
+type jumpDistributor struct {
+	partitionN int
+}
+
+func newJumpDistributor(partitionN int) *jumpDistributor {
+	return &jumpDistributor{
+		partitionN: partitionN,
+	}
+}
+
+// NodeOwners returns a list of nodes that own a fragment.
+func (d *jumpDistributor) NodeOwners(nodeIDs []string, replicaN int, index string, shard uint64) []string {
+	return d.shardNodes(nodeIDs, replicaN, index, shard)
+}
+
+// AddNode is a nop for Jump and only exists to satisfy the `ShardDistributor` interface.
+func (d *jumpDistributor) AddNode(nodeID string) error { return nil }
+
+// RemoveNode is a nop for Jump and only exists to satisfy the `ShardDistributor` interface.
+func (d *jumpDistributor) RemoveNode(nodeID string) error { return nil }
 
 // Hash returns the integer hash for the given key.
-func (h *jmphasher) Hash(key uint64, n int) int {
+func (d *jumpDistributor) Hash(key uint64, n int) int {
 	b, j := int64(-1), int64(0)
 	for j < int64(n) {
 		b = j
@@ -931,6 +964,46 @@ func (h *jmphasher) Hash(key uint64, n int) int {
 		j = int64(float64(b+1) * (float64(int64(1)<<31) / float64((key>>33)+1)))
 	}
 	return int(b)
+}
+
+// partitionID returns the partition that a shard belongs to.
+func (d *jumpDistributor) partitionID(index string, shard uint64) int {
+	var buf [8]byte
+	binary.BigEndian.PutUint64(buf[:], shard)
+
+	// Hash the bytes and mod by partition count.
+	h := fnv.New64a()
+	_, _ = h.Write([]byte(index))
+	_, _ = h.Write(buf[:])
+	return int(h.Sum64() % uint64(d.partitionN))
+}
+
+// partitionNodes returns a list of nodes that own a partition. unprotected.
+func (d *jumpDistributor) partitionNodes(nodeIDs []string, partitionID, replicaN int) []string {
+	// Default replica count to between one and the number of nodes.
+	// The replica count can be zero if there are no nodes.
+	if replicaN > len(nodeIDs) {
+		replicaN = len(nodeIDs)
+	} else if replicaN == 0 {
+		replicaN = 1
+	}
+
+	// Determine primary owner node.
+	nodeIndex := d.Hash(uint64(partitionID), len(nodeIDs))
+
+	// Collect nodes around the ring.
+	nodes := make([]string, replicaN)
+	for i := 0; i < replicaN; i++ {
+		nodes[i] = nodeIDs[(nodeIndex+i)%len(nodeIDs)]
+	}
+
+	return nodes
+}
+
+// shardNodes returns a list of nodes that own a fragment. unprotected
+func (d *jumpDistributor) shardNodes(nodeIDs []string, replicaN int, index string, shard uint64) []string {
+	partitionID := d.partitionID(index, shard)
+	return d.partitionNodes(nodeIDs, partitionID, replicaN)
 }
 
 func (c *cluster) setup() error {
@@ -1200,8 +1273,8 @@ func (c *cluster) unprotectedGenerateResizeJobByAction(nodeAction nodeAction) (*
 	// toCluster is a clone of Cluster with the new node added/removed for comparison.
 	toCluster := newCluster()
 	toCluster.nodes = Nodes(c.nodes).Clone()
-	toCluster.Hasher = c.Hasher
-	toCluster.partitionN = c.partitionN
+	toCluster.shardDistributors = shardDistributors(c.shardDistributors).Clone()
+	toCluster.defaultShardDistributor = c.defaultShardDistributor
 	toCluster.ReplicaN = c.ReplicaN
 	if nodeAction.action == resizeJobActionRemove {
 		toCluster.removeNodeBasicSorted(nodeAction.node.ID)

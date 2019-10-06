@@ -40,6 +40,8 @@ type Index struct {
 	name string
 	keys bool // use string keys
 
+	shardDistributor string
+
 	// Existence tracking.
 	trackExistence bool
 	existenceFld   *Field
@@ -102,8 +104,9 @@ func (i *Index) Options() IndexOptions {
 
 func (i *Index) options() IndexOptions {
 	return IndexOptions{
-		Keys:           i.keys,
-		TrackExistence: i.trackExistence,
+		Keys:             i.keys,
+		TrackExistence:   i.trackExistence,
+		ShardDistributor: i.shardDistributor,
 	}
 }
 
@@ -221,6 +224,7 @@ func (i *Index) loadMeta() error {
 	// Copy metadata fields.
 	i.keys = pb.Keys
 	i.trackExistence = pb.TrackExistence
+	i.shardDistributor = pb.ShardDistributor
 
 	return nil
 }
@@ -229,8 +233,9 @@ func (i *Index) loadMeta() error {
 func (i *Index) saveMeta() error {
 	// Marshal metadata.
 	buf, err := proto.Marshal(&internal.IndexMeta{
-		Keys:           i.keys,
-		TrackExistence: i.trackExistence,
+		Keys:             i.keys,
+		TrackExistence:   i.trackExistence,
+		ShardDistributor: i.shardDistributor,
 	})
 	if err != nil {
 		return errors.Wrap(err, "marshalling")
@@ -259,6 +264,11 @@ func (i *Index) Close() error {
 		}
 	}
 	i.fields = make(map[string]*Field)
+
+	// Save meta to preserve shard distributor info.
+	if err := i.saveMeta(); err != nil {
+		return errors.Wrap(err, "saving meta")
+	}
 
 	return nil
 }
@@ -497,8 +507,9 @@ func (p indexInfoSlice) Less(i, j int) bool { return p[i].Name < p[j].Name }
 
 // IndexOptions represents options to set when initializing an index.
 type IndexOptions struct {
-	Keys           bool `json:"keys"`
-	TrackExistence bool `json:"trackExistence"`
+	Keys             bool   `json:"keys"`
+	TrackExistence   bool   `json:"trackExistence"`
+	ShardDistributor string `json:"shardDistributor"`
 }
 
 // hasTime returns true if a contains a non-nil time.

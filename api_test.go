@@ -27,17 +27,22 @@ import (
 	"github.com/pilosa/pilosa/test"
 )
 
+const MOD = "mod"
+
 func TestAPI_Import(t *testing.T) {
+	partitionN := 2
 	c := test.MustRunCluster(t, 2,
 		[]server.CommandOption{
 			server.OptCommandServerOptions(
 				pilosa.OptServerNodeID("node0"),
-				pilosa.OptServerClusterHasher(&offsetModHasher{}),
+				pilosa.OptServerShardDistributors(map[string]pilosa.ShardDistributor{MOD: newOffsetModDistributor(partitionN)}),
+				pilosa.OptServerDefaultShardDistributor(MOD),
 			)},
 		[]server.CommandOption{
 			server.OptCommandServerOptions(
 				pilosa.OptServerNodeID("node1"),
-				pilosa.OptServerClusterHasher(&offsetModHasher{}),
+				pilosa.OptServerShardDistributors(map[string]pilosa.ShardDistributor{MOD: newOffsetModDistributor(partitionN)}),
+				pilosa.OptServerDefaultShardDistributor(MOD),
 			)},
 	)
 	defer c.Close()
@@ -173,16 +178,19 @@ func TestAPI_Import(t *testing.T) {
 }
 
 func TestAPI_ImportValue(t *testing.T) {
+	partitionN := 2
 	c := test.MustRunCluster(t, 2,
 		[]server.CommandOption{
 			server.OptCommandServerOptions(
 				pilosa.OptServerNodeID("node0"),
-				pilosa.OptServerClusterHasher(&offsetModHasher{}),
+				pilosa.OptServerShardDistributors(map[string]pilosa.ShardDistributor{MOD: newOffsetModDistributor(partitionN)}),
+				pilosa.OptServerDefaultShardDistributor(MOD),
 			)},
 		[]server.CommandOption{
 			server.OptCommandServerOptions(
 				pilosa.OptServerNodeID("node1"),
-				pilosa.OptServerClusterHasher(&offsetModHasher{}),
+				pilosa.OptServerShardDistributors(map[string]pilosa.ShardDistributor{MOD: newOffsetModDistributor(partitionN)}),
+				pilosa.OptServerDefaultShardDistributor(MOD),
 			)},
 	)
 	defer c.Close()
@@ -242,9 +250,28 @@ func TestAPI_ImportValue(t *testing.T) {
 	})
 }
 
-// offsetModHasher represents a simple, mod-based hashing offset by 1.
-type offsetModHasher struct{}
-
-func (*offsetModHasher) Hash(key uint64, n int) int {
-	return int(key+1) % n
+// offsetModDistributor represents a simple, mod-based shard distributor offset by 1.
+type offsetModDistributor struct {
+	partitionN int
 }
+
+// NewModDistributor returns a new instance of ModDistributor.
+func newOffsetModDistributor(partitionN int) *offsetModDistributor {
+	return &offsetModDistributor{partitionN: partitionN}
+}
+
+// NodeOwners satisfies the ShardDistributor interface.
+func (d *offsetModDistributor) NodeOwners(nodeIDs []string, replicaN int, index string, shard uint64) []string {
+	idx := int((shard + 1) % uint64(d.partitionN))
+	owners := make([]string, 0, replicaN)
+	for i := 0; i < replicaN; i++ {
+		owners = append(owners, nodeIDs[(idx+i)%len(nodeIDs)])
+	}
+	return owners
+}
+
+// AddNode is a nop and only exists to satisfy the `ShardDistributor` interface.
+func (d *offsetModDistributor) AddNode(nodeID string) error { return nil }
+
+// RemoveNode is a nop and only exists to satisfy the `ShardDistributor` interface.
+func (d *offsetModDistributor) RemoveNode(nodeID string) error { return nil }

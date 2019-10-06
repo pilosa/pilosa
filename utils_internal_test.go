@@ -27,6 +27,8 @@ import (
 	"github.com/pkg/errors"
 )
 
+const MOD = "mod"
+
 // NewTestCluster returns a cluster with n nodes and uses a mod-based hasher.
 func NewTestCluster(n int) *cluster {
 	path, err := ioutil.TempDir("", "pilosa-cluster-")
@@ -36,7 +38,8 @@ func NewTestCluster(n int) *cluster {
 
 	c := newCluster()
 	c.ReplicaN = 1
-	c.Hasher = NewTestModHasher()
+	c.shardDistributors = map[string]ShardDistributor{MOD: NewTestModDistributor(defaultPartitionN)}
+	c.defaultShardDistributor = MOD
 	c.Path = path
 	c.Topology = newTopology()
 
@@ -70,13 +73,31 @@ func NewTestURIFromHostPort(host string, port uint16) URI {
 	return *uri
 }
 
-// ModHasher represents a simple, mod-based hashing.
-type TestModHasher struct{}
+// ModDistributor represents a simple, mod-based shard distributor.
+type TestModDistributor struct {
+	partitionN int
+}
 
-// NewTestModHasher returns a new instance of ModHasher with n buckets.
-func NewTestModHasher() *TestModHasher { return &TestModHasher{} }
+// NewTestModDistributor returns a new instance of ModDistributor.
+func NewTestModDistributor(partitionN int) *TestModDistributor {
+	return &TestModDistributor{partitionN: partitionN}
+}
 
-func (*TestModHasher) Hash(key uint64, n int) int { return int(key) % n }
+// NodeOwners satisfies the ShardDistributor interface.
+func (d *TestModDistributor) NodeOwners(nodeIDs []string, replicaN int, index string, shard uint64) []string {
+	idx := int(shard % uint64(d.partitionN))
+	owners := make([]string, 0, replicaN)
+	for i := 0; i < replicaN; i++ {
+		owners = append(owners, nodeIDs[(idx+i)%len(nodeIDs)])
+	}
+	return owners
+}
+
+// AddNode is a nop and only exists to satisfy the `ShardDistributor` interface.
+func (d *TestModDistributor) AddNode(nodeID string) error { return nil }
+
+// RemoveNode is a nop and only exists to satisfy the `ShardDistributor` interface.
+func (d *TestModDistributor) RemoveNode(nodeID string) error { return nil }
 
 // ClusterCluster represents a cluster of test nodes, each of which
 // has a Cluster.
@@ -220,11 +241,13 @@ func (t *ClusterCluster) addCluster(i int, saveTopology bool) (*cluster, error) 
 	// holder
 	h := NewHolder()
 	h.Path = path
+	h.defaultShardDistributor = MOD
 
 	// cluster
 	c := newCluster()
 	c.ReplicaN = 1
-	c.Hasher = NewTestModHasher()
+	c.shardDistributors = map[string]ShardDistributor{MOD: NewTestModDistributor(defaultPartitionN)}
+	c.defaultShardDistributor = MOD
 	c.Path = path
 	c.Topology = newTopology()
 	c.holder = h
@@ -243,6 +266,11 @@ func (t *ClusterCluster) addCluster(i int, saveTopology bool) (*cluster, error) 
 
 	// Add this node to the ClusterCluster.
 	t.Clusters = append(t.Clusters, c)
+
+	// Update modulus of modhasher on cluster addition.
+	for _, c := range t.Clusters {
+		c.shardDistributors[MOD] = NewTestModDistributor(len(t.Clusters))
+	}
 
 	return c, nil
 }

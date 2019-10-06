@@ -14,7 +14,28 @@
 
 package test
 
-// modHasher represents a simple, mod-based hashing.
-type ModHasher struct{}
+// ModDistributor represents a simple, mod-based shard distributor.
+type ModDistributor struct {
+	partitionN int
+}
 
-func (*ModHasher) Hash(key uint64, n int) int { return int(key) % n }
+// NewModDistributor returns a new instance of ModDistributor.
+func NewModDistributor(partitionN int) *ModDistributor {
+	return &ModDistributor{partitionN: partitionN}
+}
+
+// NodeOwners satisfies the ShardDistributor interface.
+func (d *ModDistributor) NodeOwners(nodeIDs []string, replicaN int, index string, shard uint64) []string {
+	idx := int(shard % uint64(d.partitionN))
+	owners := make([]string, 0, replicaN)
+	for i := 0; i < replicaN; i++ {
+		owners = append(owners, nodeIDs[(idx+i)%len(nodeIDs)])
+	}
+	return owners
+}
+
+// AddNode is a nop and only exists to satisfy the `ShardDistributor` interface.
+func (d *ModDistributor) AddNode(nodeID string) error { return nil }
+
+// RemoveNode is a nop and only exists to satisfy the `ShardDistributor` interface.
+func (d *ModDistributor) RemoveNode(nodeID string) error { return nil }
